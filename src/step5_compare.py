@@ -1,20 +1,21 @@
 """
-第 5 步：市场 vs 天气模型 —— 谁的概率更准？
+Step 5: market vs. weather model -- whose probabilities are more accurate?
 
-运行：  python src/step5_compare.py
-输出：  data/prices_hourly.csv        所有合约的逐小时买价 / 卖价（从 K 线整理出来）
-        data/compare.csv              每个合约：市场概率、模型概率、校准后模型概率、结果
-        figures/step5_calibration.png 市场和模型的校准曲线放在一起
+Run:     python src/step5_compare.py
+Output:  data/prices_hourly.csv        hourly bid/ask for every contract (parsed candles)
+         data/compare.csv              per contract: market, model, recalibrated model, outcome
+         figures/step5_calibration.png market and model calibration curves
 
-（第 2 步没下载完也可以先跑，只会用已经下载好的那部分合约。）
-
-三块内容：
-  A. 市场概率：取“前一天下午 4 点（纽约时间）”那一刻的买价和卖价，取中间值（mid）。
-     - 价差（ask − bid）太大的，说明那一刻没什么人交易，价格不可靠，过滤掉。
-     - 同一天 6 个区间的 mid 加起来往往略大于 1（做市商要赚钱），所以除以总和，归一化。
-  B. 用 logistic regression 重新校准模型（第 4 步发现模型在高概率端过度自信）。
-     - 只用【之前月份】的数据来拟合，再用到当月 —— 和误差模型一样，不偷看未来。
-  C. 在同一批合约上比较 Brier score 和校准曲线。
+Three parts:
+  A. Market probability: the bid and ask at 4 pm New York time on the previous day,
+     averaged to a mid-price.
+     - Wide spreads (ask - bid) mean little trading at that moment, so those quotes are dropped.
+     - The six mids on a day usually sum to slightly more than 1 (the market maker's margin),
+       so they are divided by their sum.
+  B. Recalibrate the model with logistic regression (step 4 showed it is overconfident).
+     - Fitted only on earlier months and applied to the current month, so nothing from the
+       future is used.
+  C. Compare Brier scores and calibration curves on the same set of contracts.
 """
 
 import glob
@@ -27,13 +28,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-SNAP_HOUR = 16       # 前一天下午 4 点
-MAX_SPREAD = 0.10    # 价差超过 10 美分就不用
+SNAP_HOUR = 16       # 4 pm on the previous day
+MAX_SPREAD = 0.10    # ignore quotes with a spread above 10 cents
 
 
-# ---------- A. 整理 K 线，取快照价格 ----------
+# ---------- A. Parse candles, take snapshot quotes ----------
 def pick(d, *keys):
-    """新旧两个接口的字段名不一样（close_dollars / close），哪个有就用哪个。"""
+    """The live and historical endpoints name fields differently (close_dollars / close)."""
     for k in keys:
         if d and d.get(k) is not None:
             return float(d[k])
@@ -61,7 +62,7 @@ def load_prices():
 
 
 def snapshot(prices, markets):
-    """对每个合约，找“快照时刻或之前最后一根 K 线”的买卖价。"""
+    """For each contract, the bid/ask from the last candle at or before the snapshot time."""
     snap = (markets["date"] - pd.Timedelta(days=1) + pd.Timedelta(hours=SNAP_HOUR))
     markets = markets.assign(snap_ts=snap.dt.tz_localize("America/New_York")
                              .dt.tz_convert("UTC").astype("int64") // 10**9)
@@ -72,7 +73,7 @@ def snapshot(prices, markets):
     return out
 
 
-# ---------- B. logistic regression 校准 ----------
+# ---------- B. Logistic-regression recalibration ----------
 def logit(p):
     p = np.clip(p, 0.005, 0.995)
     return np.log(p / (1 - p))
@@ -80,9 +81,10 @@ def logit(p):
 
 def fit_logistic(x, y, iters=25):
     """
-    拟合 P(y=1) = 1 / (1 + exp(−(a + b·x)))，x = logit(模型概率)。
-    用牛顿法求最大似然 —— 只有两个参数，自己写几行就够，不需要 sklearn。
-    直觉：b < 1 表示模型太自信，需要把概率往 50% 方向“压”；a 调整整体偏高或偏低。
+    Fit P(y=1) = 1 / (1 + exp(-(a + b*x))) with x = logit(model probability),
+    by maximum likelihood using Newton's method. With two parameters a few lines suffice.
+    Intuition: b < 1 means the model is overconfident and its probabilities should be pulled
+    towards 50%; a shifts them up or down overall.
     """
     X = np.column_stack([np.ones_like(x), x])
     w = np.zeros(2)
@@ -95,20 +97,20 @@ def fit_logistic(x, y, iters=25):
 
 
 def recalibrate(df):
-    """按月滚动：每个月用之前所有月份的数据拟合，再用到这个月。"""
+    """Expanding window by month: fit on all earlier months, apply to the current month."""
     df = df.sort_values("date").copy()
     df["p_recal"] = np.nan
     months = df["date"].dt.to_period("M")
     for mth in months.unique():
         train = df[months < mth]
-        if len(train) < 1500:          # 数据太少的早期月份不校准
+        if len(train) < 1500:          # skip early months with too little history
             continue
         a, b = fit_logistic(logit(train["p_model"].values), train["y"].values)
         idx = months == mth
         df.loc[idx, "p_recal"] = 1 / (1 + np.exp(-(a + b * logit(df.loc[idx, "p_model"].values))))
-    # 校准后同一天 6 个区间的概率之和不再是 1，重新归一化
+    # after recalibration the six ranges no longer sum to 1, so renormalise
     df["p_recal"] = df["p_recal"] / df.groupby("date")["p_recal"].transform("sum")
-    print(f"最近一次拟合：a = {a:.2f}, b = {b:.2f}")
+    print(f"Latest fit: a = {a:.2f}, b = {b:.2f}")
     return df
 
 
@@ -121,22 +123,22 @@ if __name__ == "__main__":
     model = recalibrate(model)
 
     prices = load_prices()
-    print(f"已下载价格的合约：{prices['ticker'].nunique()} 个")
+    print(f"Contracts with price data: {prices['ticker'].nunique()}")
 
     df = snapshot(prices, model)
     n0 = len(df)
     df = df.dropna(subset=["mid"])
-    # 只保留 6 个区间都有可靠报价的日子，否则没法归一化
+    # keep only days where all six ranges have reliable quotes, so they can be normalised
     ok = df.groupby("date")["spread"].transform(lambda s: (s <= MAX_SPREAD).all() and len(s) == 6)
     df = df[ok.astype(bool)].copy()
     df["p_market"] = df["mid"] / df.groupby("date")["mid"].transform("sum")
     df = df.dropna(subset=["p_recal"])
-    print(f"可比较的合约：{len(df)} 个，{df['date'].nunique()} 天（原有 {n0} 个）")
+    print(f"Contracts compared: {len(df)} over {df['date'].nunique()} days (of {n0})")
 
-    print("\nBrier score（越小越好），同一批合约：")
-    for col, lab in [("p_market", "市场"), ("p_recal", "模型（校准后）"),
-                     ("p_model", "模型（原始）"), ("p_clim", "气候基线")]:
-        print(f"  {lab:10s} {brier(df[col], df['y']):.4f}")
+    print("\nBrier score (lower is better), same contracts:")
+    for col, lab in [("p_market", "Market"), ("p_recal", "Model (recalibrated)"),
+                     ("p_model", "Model (raw)"), ("p_clim", "Climatology")]:
+        print(f"  {lab:22s} {brier(df[col], df['y']):.4f}")
 
     df[["ticker", "date", "lo", "hi", "y", "actual", "bid", "ask", "spread",
         "p_market", "p_model", "p_recal", "p_clim"]].to_csv("data/compare.csv", index=False)
@@ -152,4 +154,4 @@ if __name__ == "__main__":
     ax.set_title(f"Market vs model ({df['date'].nunique()} days)")
     ax.legend(frameon=False, fontsize=9)
     fig.tight_layout(); fig.savefig("figures/step5_calibration.png", dpi=150)
-    print("图已保存到 figures/step5_calibration.png")
+    print("Figure saved to figures/step5_calibration.png")
