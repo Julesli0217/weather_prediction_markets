@@ -1,0 +1,9 @@
+# Python environment
+.venv/
+__pycache__/
+
+# Downloaded data (large; the scripts re-download it)
+data/
+
+# macOS
+.DS_Store
